@@ -41,14 +41,16 @@ int sizeVarInt (uint32_t value) {
 }
 
 void writeVarInt (int client_fd, uint32_t value) {
+  // Encode the whole VarInt up front, then write it out in one go
+  uint8_t buf[5];
+  int len = 0;
   while (true) {
     if ((value & ~SEGMENT_BITS) == 0) {
-      writeByte(client_fd, value);
-      return;
+      buf[len ++] = value;
+      break;
     }
-
-    writeByte(client_fd, (value & SEGMENT_BITS) | CONTINUE_BIT);
-
+    buf[len ++] = (value & SEGMENT_BITS) | CONTINUE_BIT;
     value >>= 7;
   }
+  send_all(client_fd, buf, len);
 }

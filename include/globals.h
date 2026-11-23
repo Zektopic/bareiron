@@ -109,6 +109,12 @@
 // This matches the protocol limit of a 3-byte VarInt (2^21 - 1).
 #define MAX_PACKET_LEN 2097151
 
+// Size of the buffer used to combine small outgoing writes into fewer
+// send() calls. Packets are written field by field, so without this,
+// most packets take one system call (or lwIP call) per field. Writes at
+// least this large bypass the buffer. Comment out to disable buffering.
+#define SEND_BUFFER_SIZE 128
+
 // If defined, sends the server brand to clients. Doesn't do much, but will
 // show up in the top-left of the F3/debug menu, in the Minecraft client.
 // You can change the brand string in the "brand" variable in src/globals.c
