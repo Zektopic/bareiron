@@ -74,13 +74,20 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
 
     case 0x00:
       if (state == STATE_NONE) {
-        if (cs_handshake(client_fd)) break;
+        if (cs_handshake(client_fd)) {
+          if (recv_count == 0) return;
+          break;
+        }
       } else if (state == STATE_STATUS) {
         if (sc_statusResponse(client_fd)) break;
       } if (state == STATE_LOGIN) {
         uint8_t uuid[16];
         char name[16];
-        if (cs_loginStart(client_fd, uuid, name)) break;
+        if (cs_loginStart(client_fd, uuid, name)) {
+          // Drop clients with malformed or invalid login data
+          recv_count = 0;
+          return;
+        }
         if (reservePlayerData(client_fd, uuid, name)) {
           recv_count = 0;
           return;
@@ -524,7 +531,7 @@ int main () {
   if (initSerializer()) exit(EXIT_FAILURE);
 
   // Initialize all file descriptor references to -1 (unallocated)
-  int clients[MAX_PLAYERS], client_index = 0;
+  int client_index = 0;
   for (int i = 0; i < MAX_PLAYERS; i ++) {
     clients[i] = -1;
     client_states[i * 2] = -1;
@@ -693,13 +700,13 @@ int main () {
 
     // Read packet length
     int length = readVarInt(client_fd);
-    if (length == VARNUM_ERROR) {
+    if (length == VARNUM_ERROR || length <= 0 || length > MAX_PACKET_LEN) {
       disconnectClient(&clients[client_index], 2);
       continue;
     }
     // Read packet ID
     int packet_id = readVarInt(client_fd);
-    if (packet_id == VARNUM_ERROR) {
+    if (packet_id == VARNUM_ERROR || sizeVarInt(packet_id) > length) {
       disconnectClient(&clients[client_index], 3);
       continue;
     }

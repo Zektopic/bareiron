@@ -232,7 +232,7 @@ double readDouble (int client_fd) {
 ssize_t readLengthPrefixedData (int client_fd) {
   uint32_t length = readVarInt(client_fd);
   if (length >= MAX_RECV_BUF_LEN) {
-    printf("ERROR: Received length (%lu) exceeds maximum (%u)\n", length, MAX_RECV_BUF_LEN);
+    printf("ERROR: Received length (%u) exceeds maximum (%u)\n", (unsigned int)length, MAX_RECV_BUF_LEN);
     disconnectClient(&client_fd, -1);
     recv_count = 0;
     return 0;
@@ -240,32 +240,60 @@ ssize_t readLengthPrefixedData (int client_fd) {
   return recv_all(client_fd, recv_buffer, length, false);
 }
 
+// Null-terminates recv_buffer after a string read.
+// recv_count may be -1 after a failed read, which must never be used
+// as an index, so treat that case as an empty string.
+static void terminateRecvString () {
+  if (recv_count < 0 || recv_count >= MAX_RECV_BUF_LEN) recv_buffer[0] = '\0';
+  else recv_buffer[recv_count] = '\0';
+}
+
 // Reads a networked string into recv_buffer
 void readString (int client_fd) {
   recv_count = readLengthPrefixedData(client_fd);
-  recv_buffer[recv_count] = '\0';
+  terminateRecvString();
 }
 // Reads a networked string of up to N bytes into recv_buffer
 void readStringN (int client_fd, uint32_t max_length) {
   // Forward to readString if max length is invalid
-  if (max_length >= MAX_RECV_BUF_LEN) {
+  // (one byte is reserved for the null terminator)
+  if (max_length >= MAX_RECV_BUF_LEN - 1) {
     readString(client_fd);
     return;
   }
   // Attempt to read full string within maximum
   uint32_t length = readVarInt(client_fd);
+  if (recv_count != 1 || length == VARNUM_ERROR || length > MAX_PACKET_LEN) {
+    // Malformed or impossible length prefix, there's no string to read
+    recv_count = -1;
+    recv_buffer[0] = '\0';
+    return;
+  }
   if (max_length > length) {
     recv_count = recv_all(client_fd, recv_buffer, length, false);
-    recv_buffer[recv_count] = '\0';
+    terminateRecvString();
     return;
   }
   // Read string up to maximum, dump the rest
   recv_count = recv_all(client_fd, recv_buffer, max_length, false);
-  recv_buffer[recv_count] = '\0';
-  uint8_t dummy;
-  for (uint32_t i = max_length; i < length; i ++) {
-    recv_all(client_fd, &dummy, 1, false);
+  terminateRecvString();
+  if (recv_count != (ssize_t)max_length) return;
+  // Discard the excess into the unused tail of recv_buffer, so that the
+  // string we just read is preserved. This avoids issuing one recv call
+  // per discarded byte, as well as needing any extra buffer space.
+  ssize_t kept = recv_count;
+  uint8_t *scratch = recv_buffer + kept + 1;
+  size_t scratch_len = MAX_RECV_BUF_LEN - kept - 1;
+  size_t remaining = length - max_length;
+  while (remaining > 0) {
+    size_t n = remaining > scratch_len ? scratch_len : remaining;
+    if (recv_all(client_fd, scratch, n, false) != (ssize_t)n) {
+      recv_count = -1;
+      return;
+    }
+    remaining -= n;
   }
+  recv_count = kept;
 }
 
 uint32_t fast_rand () {

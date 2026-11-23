@@ -105,6 +105,10 @@
 // Size of the receive buffer for incoming string data
 #define MAX_RECV_BUF_LEN 256
 
+// Largest packet length accepted from clients, in bytes.
+// This matches the protocol limit of a 3-byte VarInt (2^21 - 1).
+#define MAX_PACKET_LEN 2097151
+
 // If defined, sends the server brand to clients. Doesn't do much, but will
 // show up in the top-left of the F3/debug menu, in the Minecraft client.
 // You can change the brand string in the "brand" variable in src/globals.c
@@ -187,6 +191,8 @@ extern uint8_t motd_len;
 #endif
 
 extern uint16_t client_count;
+// Socket file descriptors of all connected clients, -1 when unused
+extern int clients[MAX_PLAYERS];
 
 typedef struct {
   short x;
