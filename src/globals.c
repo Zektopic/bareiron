@@ -46,6 +46,7 @@ uint8_t motd_len = sizeof(motd) - 1;
 #endif
 
 uint16_t client_count;
+int clients[MAX_PLAYERS];
 
 BlockChange block_changes[MAX_BLOCK_CHANGES];
 int block_changes_count = 0;

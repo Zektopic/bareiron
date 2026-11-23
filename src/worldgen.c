@@ -348,7 +348,10 @@ ChunkFeature getFeatureFromAnchor (ChunkAnchor anchor) {
       mod_abs(feature.x, CHUNK_SIZE), mod_abs(feature.z, CHUNK_SIZE),
       anchor.x, anchor.z, anchor.hash, anchor.biome
     ) + 1;
-    feature.variant = (anchor.hash >> (feature.x + feature.z)) & 1;
+    // Mask the shift amount, as shifting by a negative amount or by more
+    // than the width of the type is undefined behavior. Most targets mask
+    // it this way in hardware anyway, so this preserves world generation.
+    feature.variant = (anchor.hash >> ((feature.x + feature.z) & 31)) & 1;
   }
 
   return feature;

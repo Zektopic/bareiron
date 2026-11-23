@@ -57,6 +57,13 @@ int cs_handshake (int client_fd) {
   int intent = readVarInt(client_fd);
   if (intent == VARNUM_ERROR) return 1;
   printf("  Intent: %d\n\n", intent);
+  // Only status (1), login (2) and transfer (3) are valid intents.
+  // Accepting anything else would let a client jump straight into
+  // the configuration or play states without ever logging in.
+  if (intent != STATE_STATUS && intent != STATE_LOGIN && intent != STATE_TRANSFER) {
+    recv_count = 0; // Signals the main loop to drop this client
+    return 1;
+  }
   setClientState(client_fd, intent);
 
   return 0;
@@ -72,8 +79,26 @@ int cs_loginStart (int client_fd, uint8_t *uuid, char *name) {
   name[16 - 1] = '\0';
   printf("  Player name: %s\n", name);
   recv_count = recv_all(client_fd, recv_buffer, 16, false);
-  if (recv_count == -1) return 1;
+  if (recv_count != 16) return 1;
   memcpy(uuid, recv_buffer, 16);
+
+  // Player names are echoed to every client in chat, the tab list and
+  // join/leave/death messages. Restrict them to the vanilla character set
+  // so that they can't carry formatting codes, newlines or other control
+  // characters used to spoof messages.
+  if (name[0] == '\0') return 1;
+  for (int i = 0; name[i] != '\0'; i ++) {
+    char c = name[i];
+    if (
+      !(c >= 'a' && c <= 'z') &&
+      !(c >= 'A' && c <= 'Z') &&
+      !(c >= '0' && c <= '9') &&
+      c != '_'
+    ) {
+      printf("  Rejecting invalid player name\n\n");
+      return 1;
+    }
+  }
   printf("  Player UUID: ");
   for (int i = 0; i < 16; i ++) printf("%x", uuid[i]);
   printf("\n\n");
@@ -594,7 +619,10 @@ int cs_clickContainer (int client_fd) {
   if (mode == 4 && clicked_slot != -999) {
     // when using drop button, re-sync the respective slot
     uint8_t slot = clientSlotToServerSlot(window_id, clicked_slot);
-    sc_setContainerSlot(client_fd, window_id, clicked_slot, player->inventory_count[slot], player->inventory_items[slot]);
+    // only plain inventory slots can be re-synced from inventory data
+    if (slot <= 40) {
+      sc_setContainerSlot(client_fd, window_id, clicked_slot, player->inventory_count[slot], player->inventory_items[slot]);
+    }
     apply_changes = false;
   } else if (mode == 0 && clicked_slot == -999) {
     // when clicking outside inventory, return the dropped item to the player
@@ -623,29 +651,58 @@ int cs_clickContainer (int client_fd) {
   memcpy(&storage_ptr, player->craft_items, sizeof(storage_ptr));
   #endif
 
+  // Bound the amount of slot changes to what a real container can have.
+  // Anything bigger is malformed, and gets cleaned up by the length checks.
+  if (changes_count < 0 || changes_count > 128) return 1;
+
   for (int i = 0; i < changes_count; i ++) {
 
     slot = clientSlotToServerSlot(window_id, readUint16(client_fd));
-    // slots outside of the inventory overflow into the crafting buffer
-    if (slot > 40 && apply_changes) craft = true;
+
+    // Whether this slot maps to valid server-side storage. Slots that
+    // don't (255) still have their item data read below, but are ignored.
+    uint8_t valid_slot = true;
 
     #ifdef ALLOW_CHESTS
     if (window_id == 2 && slot > 40) {
-      // Get item pointers from the player's storage pointer
-      // See the handlePlayerUseItem function for more info on this hack
-      p_item = (uint16_t *)(storage_ptr + (slot - 41) * 3);
-      p_count = storage_ptr + (slot - 41) * 3 + 2;
+      // The storage pointer is only valid while the player actually has
+      // a chest open, as indicated by the craft_items lock. Without this
+      // check, the "pointer" would be built from crafting grid contents,
+      // which are fully controlled by the client.
+      // Chests also only have 27 slots (41 to 67 on the server side).
+      if (!(player->flags & 0x80) || slot > 67) {
+        valid_slot = false;
+        p_item = NULL;
+        p_count = NULL;
+      } else {
+        // Get item pointers from the player's storage pointer
+        // See the handlePlayerUseItem function for more info on this hack
+        p_item = (uint16_t *)(storage_ptr + (slot - 41) * 3);
+        p_count = storage_ptr + (slot - 41) * 3 + 2;
+      }
     } else
     #endif
     {
       // Prevent accessing crafting-related slots when craft_items is locked
       if (slot > 40 && player->flags & 0x80) return 1;
-      p_item = &player->inventory_items[slot];
-      p_count = &player->inventory_count[slot];
+      // Only the inventory (0-40) and crafting grid (41-49) are backed by
+      // player data. Anything past that (including 255, which marks an
+      // unmapped slot) would index out of bounds.
+      if (slot > 49) {
+        valid_slot = false;
+        p_item = NULL;
+        p_count = NULL;
+      } else {
+        p_item = &player->inventory_items[slot];
+        p_count = &player->inventory_count[slot];
+      }
     }
 
+    // slots outside of the inventory overflow into the crafting buffer
+    if (valid_slot && slot > 40 && apply_changes) craft = true;
+
     if (!readByte(client_fd)) { // no item?
-      if (slot != 255 && apply_changes) {
+      if (valid_slot && apply_changes) {
         *p_item = 0;
         *p_count = 0;
         #ifdef ALLOW_CHESTS
@@ -664,7 +721,7 @@ int cs_clickContainer (int client_fd) {
     readLengthPrefixedData(client_fd);
     readLengthPrefixedData(client_fd);
 
-    if (count > 0 && apply_changes) {
+    if (valid_slot && count > 0 && apply_changes) {
       *p_item = item;
       *p_count = count;
       #ifdef ALLOW_CHESTS
@@ -842,8 +899,12 @@ int cs_closeContainer (int client_fd) {
 
   // return all items in crafting slots to the player
   // or, in the case of chests, simply clear the storage pointer
+  // While craft_items is locked, it holds a chest storage pointer rather
+  // than items, so it must never be handed back to the player as items.
+  // Check the lock itself rather than trusting the client's window ID.
+  uint8_t holds_items = !(player->flags & 0x80);
   for (uint8_t i = 0; i < 9; i ++) {
-    if (window_id != 2) {
+    if (holds_items) {
       givePlayerItem(player, player->craft_items[i], player->craft_count[i]);
       uint8_t client_slot = serverSlotToClientSlot(window_id, 41 + i);
       if (client_slot != 255) sc_setContainerSlot(player->client_fd, window_id, client_slot, 0, 0);
@@ -1130,6 +1191,20 @@ int cs_chat (int client_fd) {
   size_t message_len = strlen((char *)recv_buffer);
   uint8_t name_len = strlen(player->name);
 
+  // Like vanilla, refuse messages with control characters or the section
+  // sign (formatting codes). The vanilla client can't type these, and they
+  // would let a modified client inject fake lines (e.g. impersonating
+  // another player) or arbitrary formatting into everyone's chat.
+  for (size_t i = 0; i < message_len; i ++) {
+    if (
+      recv_buffer[i] < 0x20 || recv_buffer[i] == 0x7F ||
+      (recv_buffer[i] == 0xC2 && recv_buffer[i + 1] == 0xA7)
+    ) {
+      sc_systemChat(client_fd, "§7Illegal characters in chat", 29);
+      goto cleanup;
+    }
+  }
+
   if (recv_buffer[0] != '!') { // Standard chat message
 
     // Shift message contents forward to make space for player name tag
@@ -1159,17 +1234,25 @@ int cs_chat (int client_fd) {
     int target_end_offset = 0;
     int text_offset = 0;
 
+    // All parsing below must stay within the received message. Past its
+    // end, recv_buffer holds stale data from earlier packets, which would
+    // otherwise be parsed as arguments and make text_len negative.
+    if (target_offset > (int)message_len) target_offset = message_len;
     // Skip spaces after "!msg"
-    while (recv_buffer[target_offset] == ' ') target_offset++;
+    while (target_offset < (int)message_len && recv_buffer[target_offset] == ' ') target_offset++;
     target_end_offset = target_offset;
     // Extract target name
-    while (recv_buffer[target_end_offset] != ' ' && recv_buffer[target_end_offset] != '\0' && target_end_offset < 21) target_end_offset++;
+    while (target_end_offset < (int)message_len && recv_buffer[target_end_offset] != ' ' && target_end_offset < 21) target_end_offset++;
     text_offset = target_end_offset;
     // Skip spaces before message
-    while (recv_buffer[text_offset] == ' ') text_offset++;
+    while (text_offset < (int)message_len && recv_buffer[text_offset] == ' ') text_offset++;
 
     // Send usage guide if arguments are missing
-    if (target_offset == target_end_offset || target_end_offset == text_offset) {
+    if (
+      target_offset == target_end_offset ||
+      target_end_offset == text_offset ||
+      text_offset >= (int)message_len
+    ) {
       sc_systemChat(client_fd, "§7Usage: !msg <player> <message>", 33);
       goto cleanup;
     }

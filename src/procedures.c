@@ -74,9 +74,25 @@ void resetPlayerData (PlayerData *player) {
 // Assigns the given data to a player_data entry
 int reservePlayerData (int client_fd, uint8_t *uuid, char *name) {
 
+  // An all-zero UUID is what marks unallocated player slots, so a client
+  // presenting one would be matched against a free slot below and skip
+  // initialization entirely. Reject it outright.
+  uint8_t zero_uuid = true;
+  for (int j = 0; j < 16; j ++) {
+    if (uuid[j] != 0) {
+      zero_uuid = false;
+      break;
+    }
+  }
+  if (zero_uuid) return 1;
+
   for (int i = 0; i < MAX_PLAYERS; i ++) {
     // Found existing player entry (UUID match)
     if (memcmp(player_data[i].uuid, uuid, 16) == 0) {
+      // Refuse to hand an active session over to a second connection.
+      // Otherwise, anyone presenting the same UUID would take over the
+      // player's data while the original connection is still alive.
+      if (player_data[i].client_fd != -1) return 1;
       // Set network file descriptor and username
       player_data[i].client_fd = client_fd;
       memcpy(player_data[i].name, name, 16);
@@ -197,18 +213,32 @@ void handlePlayerJoin (PlayerData* player) {
 }
 
 void disconnectClient (int *client_fd, int cause) {
-  if (*client_fd == -1) return;
-  client_count --;
-  setClientState(*client_fd, STATE_NONE);
-  handlePlayerDisconnect(*client_fd);
-  #ifdef _WIN32
-  closesocket(*client_fd);
-  printf("Disconnected client %d, cause: %d, errno: %d\n", *client_fd, cause, WSAGetLastError());
-  #else
-  close(*client_fd);
-  printf("Disconnected client %d, cause: %d, errno: %d\n\n", *client_fd, cause, errno);
-  #endif
+  int fd = *client_fd;
+  if (fd == -1) return;
+  // Release the main loop's reference to this socket too. Callers deep
+  // inside packet handlers only hold a copy of the descriptor, so without
+  // this, the main loop would later try to disconnect the same (already
+  // closed, possibly reused) descriptor again, double-decrementing
+  // client_count and potentially closing another client's socket.
+  uint8_t tracked = false;
+  for (int i = 0; i < MAX_PLAYERS; i ++) {
+    if (clients[i] != fd) continue;
+    clients[i] = -1;
+    tracked = true;
+  }
   *client_fd = -1;
+  // If the main loop no longer tracks this socket, it's already been closed
+  if (!tracked) return;
+  client_count --;
+  setClientState(fd, STATE_NONE);
+  handlePlayerDisconnect(fd);
+  #ifdef _WIN32
+  closesocket(fd);
+  printf("Disconnected client %d, cause: %d, errno: %d\n", fd, cause, WSAGetLastError());
+  #else
+  close(fd);
+  printf("Disconnected client %d, cause: %d, errno: %d\n\n", fd, cause, errno);
+  #endif
 }
 
 uint8_t serverSlotToClientSlot (int window_id, uint8_t slot) {
@@ -1153,6 +1183,19 @@ void playPickupAnimation (PlayerData *player, uint16_t item, double x, double y,
 }
 #endif
 
+// Checks whether the given block is within interaction range of a player.
+// Vanilla allows ~4.5 blocks in survival and 5 in creative. Since player
+// positions are stored as whole blocks, a more lenient bound is used here,
+// which still prevents clients from editing the world arbitrarily far away.
+#define MAX_INTERACT_DISTANCE 8
+static uint8_t isWithinReach (PlayerData *player, int x, int y, int z) {
+  if (y < 0 || y > 255) return false;
+  int dx = x - player->x;
+  int dy = y - player->y;
+  int dz = z - player->z;
+  return dx * dx + dy * dy + dz * dz <= MAX_INTERACT_DISTANCE * MAX_INTERACT_DISTANCE;
+}
+
 void handlePlayerAction (PlayerData *player, int action, short x, short y, short z) {
 
   // Re-sync slot when player drops an item
@@ -1175,6 +1218,9 @@ void handlePlayerAction (PlayerData *player, int action, short x, short y, short
 
   // Ignore further actions not pertaining to mining blocks
   if (action != 0 && action != 2) return;
+
+  // Ignore attempts to mine blocks out of reach
+  if (!isWithinReach(player, x, y, z)) return;
 
   // In creative, only the "start mining" action is sent
   // No additional verification is performed, the block is simply removed
@@ -1228,6 +1274,18 @@ void handlePlayerAction (PlayerData *player, int action, short x, short y, short
 }
 
 void handlePlayerUseItem (PlayerData *player, short x, short y, short z, uint8_t face) {
+
+  // Ignore attempts to interact with blocks out of reach.
+  // Re-sync the held item, as the client may have predicted its use.
+  if (face != 255 && !isWithinReach(player, x, y, z)) {
+    sc_setContainerSlot(
+      player->client_fd, 0,
+      serverSlotToClientSlot(0, player->hotbar),
+      player->inventory_count[player->hotbar],
+      player->inventory_items[player->hotbar]
+    );
+    return;
+  }
 
   // Get targeted block (if coordinates are provided)
   uint8_t target = face == 255 ? 0 : getBlockAt(x, y, z);
