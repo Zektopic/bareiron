@@ -171,6 +171,7 @@ void handlePlayerDisconnect (int client_fd) {
     strcpy((char *)recv_buffer + player_name_len, " left the game");
     // Broadcast this player's leave to all other connected clients
     for (int j = 0; j < MAX_PLAYERS; j ++) {
+      if (player_data[j].client_fd == -1) continue;
       if (player_data[j].client_fd == client_fd) continue;
       if (player_data[j].flags & 0x20) continue;
       // Send chat message
@@ -199,10 +200,11 @@ void handlePlayerJoin (PlayerData* player) {
 
   // Inform other clients (and the joining client) of the player's name and entity
   for (int i = 0; i < MAX_PLAYERS; i ++) {
+    if (player_data[i].client_fd == -1) continue;
     sc_systemChat(player_data[i].client_fd, (char *)recv_buffer, 16 + player_name_len);
-    sc_playerInfoUpdateAddPlayer(player_data[i].client_fd, *player);
+    sc_playerInfoUpdateAddPlayer(player_data[i].client_fd, player);
     if (player_data[i].client_fd != player->client_fd) {
-      sc_spawnEntityPlayer(player_data[i].client_fd, *player);
+      sc_spawnEntityPlayer(player_data[i].client_fd, player);
     }
   }
 
@@ -229,6 +231,10 @@ void disconnectClient (int *client_fd, int cause) {
   *client_fd = -1;
   // If the main loop no longer tracks this socket, it's already been closed
   if (!tracked) return;
+  // Try to deliver anything still queued for this client before closing
+  // (e.g. a status ping response), and make sure it can't leak to whichever
+  // client ends up reusing the file descriptor.
+  release_send_buffer_for(fd);
   client_count --;
   setClientState(fd, STATE_NONE);
   handlePlayerDisconnect(fd);
@@ -467,7 +473,9 @@ void broadcastMobMetadata (int client_fd, int entity_id) {
   if (mob_index < 0 || mob_index >= MAX_MOBS) return;
   MobData *mob = &mob_data[mob_index];
 
-  EntityData *metadata;
+  // Currently, at most one metadata entry is sent per mob. Keeping this
+  // on the stack avoids a heap allocation for every broadcast.
+  EntityData metadata[1];
   size_t length;
 
   switch (mob->type) {
@@ -475,7 +483,6 @@ void broadcastMobMetadata (int client_fd, int entity_id) {
       if (!((mob->data >> 5) & 1)) // Don't send metadata if sheep isn't sheared
         return;
 
-      metadata = malloc(sizeof *metadata);
       metadata[0] = (EntityData){
         17,                // Index (Sheep Bit Mask),
         0,                 // Type (Byte),
@@ -501,8 +508,6 @@ void broadcastMobMetadata (int client_fd, int entity_id) {
   } else {
     sc_setEntityMetadata(client_fd, entity_id, metadata, length);
   }
-
-  free(metadata);
 }
 
 uint8_t getBlockChange (short x, uint8_t y, short z) {

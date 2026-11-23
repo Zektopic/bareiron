@@ -441,8 +441,8 @@ int sc_chunkDataAndUpdateLight (int client_fd, int _x, int _z) {
 
   // sky light array
   writeVarInt(client_fd, 26);
-  for (int i = 0; i < 2048; i ++) chunk_section[i] = 0xFF;
-  for (int i = 2048; i < 4096; i ++) chunk_section[i] = 0;
+  memset(chunk_section, 0xFF, 2048);
+  memset(chunk_section + 2048, 0, 2048);
   for (int i = 0; i < 8; i ++) {
     writeVarInt(client_fd, 2048);
     send_all(client_fd, chunk_section + 2048, 2048);
@@ -943,19 +943,21 @@ int cs_closeContainer (int client_fd) {
 }
 
 // S->C Player Info Update, "Add Player" action
-int sc_playerInfoUpdateAddPlayer (int client_fd, PlayerData player) {
+int sc_playerInfoUpdateAddPlayer (int client_fd, PlayerData *player) {
 
-  writeVarInt(client_fd, 21 + strlen(player.name)); // Packet length
+  uint8_t name_len = strlen(player->name);
+
+  writeVarInt(client_fd, 21 + name_len); // Packet length
   writeByte(client_fd, 0x3F); // Packet ID
 
   writeByte(client_fd, 0x01); // EnumSet: Add Player
   writeByte(client_fd, 1); // Player count (1 per packet)
 
   // Player UUID
-  send_all(client_fd, player.uuid, 16);
+  send_all(client_fd, player->uuid, 16);
   // Player name
-  writeByte(client_fd, strlen(player.name));
-  send_all(client_fd, player.name, strlen(player.name));
+  writeByte(client_fd, name_len);
+  send_all(client_fd, player->name, name_len);
   // Properties (don't send any)
   writeByte(client_fd, 0);
 
@@ -1019,14 +1021,14 @@ int sc_setEntityMetadata (int client_fd, int id, EntityData *metadata, size_t le
 }
 
 // S->C Spawn Entity (from PlayerData)
-int sc_spawnEntityPlayer (int client_fd, PlayerData player) {
+int sc_spawnEntityPlayer (int client_fd, PlayerData *player) {
   return sc_spawnEntity(
     client_fd,
-    player.client_fd, player.uuid, 149,
-    player.x > 0 ? (double)player.x + 0.5 : (double)player.x - 0.5,
-    player.y,
-    player.z > 0 ? (double)player.z + 0.5 : (float)player.z - 0.5,
-    player.yaw, player.pitch
+    player->client_fd, player->uuid, 149,
+    player->x > 0 ? (double)player->x + 0.5 : (double)player->x - 0.5,
+    player->y,
+    player->z > 0 ? (double)player->z + 0.5 : (float)player->z - 0.5,
+    player->yaw, player->pitch
   );
 }
 

@@ -89,7 +89,9 @@ ssize_t recv_all (int client_fd, void *buf, size_t n, uint8_t require_first) {
   return total; // got exactly n bytes
 }
 
-ssize_t send_all (int client_fd, const void *buf, ssize_t len) {
+// Writes the given buffer to the socket, blocking (with task yielding)
+// until all of it has been sent, or until the connection times out.
+static ssize_t send_raw (int client_fd, const void *buf, ssize_t len) {
   // Treat any input buffer as *uint8_t for simplicity
   const uint8_t *p = (const uint8_t *)buf;
   ssize_t sent = 0;
@@ -133,6 +135,73 @@ ssize_t send_all (int client_fd, const void *buf, ssize_t len) {
   }
 
   return sent;
+}
+
+#ifdef SEND_BUFFER_SIZE
+// Small write-combining buffer for outgoing data.
+// Packets are serialized field by field, which would otherwise mean one
+// send() call per byte/short/varint. Collecting consecutive writes to the
+// same socket and sending them in one go cuts syscall (or lwIP) overhead
+// drastically, especially for small broadcast packets like entity movement.
+static uint8_t send_buffer[SEND_BUFFER_SIZE];
+static int send_buffer_fd = -1;
+static size_t send_buffer_len = 0;
+
+// Sends out any buffered data
+void flush_send_buffer () {
+  if (send_buffer_len == 0) return;
+  int fd = send_buffer_fd;
+  size_t len = send_buffer_len;
+  // Clear the buffer before sending, as a failed send may disconnect the
+  // client, which in turn queues messages for other clients.
+  send_buffer_len = 0;
+  send_buffer_fd = -1;
+  send_raw(fd, send_buffer, len);
+}
+
+// Releases data buffered for a socket that's about to be closed.
+// Makes a single non-blocking attempt to deliver it first (e.g. for a
+// status ping response), without the retry/timeout loop of send_raw, as
+// that could otherwise recurse into disconnecting this client again.
+void release_send_buffer_for (int client_fd) {
+  if (send_buffer_len == 0 || send_buffer_fd != client_fd) return;
+  size_t len = send_buffer_len;
+  send_buffer_len = 0;
+  send_buffer_fd = -1;
+  #ifdef _WIN32
+    send(client_fd, (const char *)send_buffer, len, 0);
+  #else
+    send(client_fd, send_buffer, len, MSG_NOSIGNAL);
+  #endif
+}
+#else
+void flush_send_buffer () {}
+void release_send_buffer_for (int client_fd) {}
+#endif
+
+ssize_t send_all (int client_fd, const void *buf, ssize_t len) {
+  if (client_fd == -1) return -1;
+  if (len <= 0) return 0;
+
+  #ifdef SEND_BUFFER_SIZE
+  // Flush pending data first if it's for another socket, or if there's no
+  // room left. This is a loop because flushing can (on failure) queue new
+  // data for other clients, so the state has to be re-checked afterwards.
+  while (send_buffer_len > 0 && (
+    send_buffer_fd != client_fd ||
+    send_buffer_len + len > SEND_BUFFER_SIZE
+  )) flush_send_buffer();
+
+  // Large writes bypass the buffer entirely (it's empty at this point)
+  if (len >= SEND_BUFFER_SIZE) return send_raw(client_fd, buf, len);
+
+  memcpy(send_buffer + send_buffer_len, buf, len);
+  send_buffer_len += len;
+  send_buffer_fd = client_fd;
+  return len;
+  #else
+  return send_raw(client_fd, buf, len);
+  #endif
 }
 
 void discard_all (int client_fd, size_t remaining, uint8_t require_first) {

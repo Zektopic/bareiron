@@ -143,8 +143,8 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
           if (player_data[i].client_fd == -1) continue;
           // Note that this will also filter out the joining player
           if (player_data[i].flags & 0x20) continue;
-          sc_playerInfoUpdateAddPlayer(client_fd, player_data[i]);
-          sc_spawnEntityPlayer(client_fd, player_data[i]);
+          sc_playerInfoUpdateAddPlayer(client_fd, &player_data[i]);
+          sc_spawnEntityPlayer(client_fd, &player_data[i]);
         }
 
         // Send information about all other entities (mobs):
@@ -599,6 +599,9 @@ int main () {
    * client connection.
    */
   while (true) {
+    // Send out anything written during the previous iteration
+    flush_send_buffer();
+
     // Check if it's time to yield to the idle task
     task_yield();
 
