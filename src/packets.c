@@ -24,21 +24,40 @@
 #include "procedures.h"
 #include "packets.h"
 
+// Returns the amount of players currently connected and logged in
+static int countOnlinePlayers () {
+  int count = 0;
+  for (int i = 0; i < MAX_PLAYERS; i ++) {
+    if (player_data[i].client_fd != -1) count ++;
+  }
+  return count;
+}
+
 // S->C Status Response (server list ping)
 int sc_statusResponse (int client_fd) {
 
   char header[] = "{"
-    "\"version\":{\"name\":\"1.21.8\",\"protocol\":772},"
-    "\"description\":{\"text\":\"";
+    "\"version\":{\"name\":\"1.21.8\",\"protocol\":772},";
+  // Player count, shown in the multiplayer server list
+  // (without this, the client displays "???" instead)
+  char players[48];
+  int players_len = snprintf(
+    players, sizeof(players),
+    "\"players\":{\"max\":%d,\"online\":%d},",
+    MAX_PLAYERS, countOnlinePlayers()
+  );
+  char description[] = "\"description\":{\"text\":\"";
   char footer[] = "\"}}";
 
-  uint16_t string_len = sizeof(header) + sizeof(footer) + motd_len - 2;
+  uint16_t string_len = (sizeof(header) - 1) + players_len + (sizeof(description) - 1) + motd_len + (sizeof(footer) - 1);
 
   writeVarInt(client_fd, 1 + string_len + sizeVarInt(string_len));
   writeByte(client_fd, 0x00);
 
   writeVarInt(client_fd, string_len);
   send_all(client_fd, header, sizeof(header) - 1);
+  send_all(client_fd, players, players_len);
+  send_all(client_fd, description, sizeof(description) - 1);
   send_all(client_fd, motd, motd_len);
   send_all(client_fd, footer, sizeof(footer) - 1);
 
@@ -1201,10 +1220,37 @@ int cs_chat (int client_fd) {
     goto cleanup;
   }
 
+  if (!strncmp((char *)recv_buffer, "!list", 5)) {
+    // List the names of all online players. The list is built in
+    // recv_buffer, and cut short if it would overflow the buffer.
+    int len = snprintf((char *)recv_buffer, MAX_RECV_BUF_LEN, "§7Online players (%d/%d): ", countOnlinePlayers(), MAX_PLAYERS);
+    uint8_t first = true;
+    for (int i = 0; i < MAX_PLAYERS; i ++) {
+      if (player_data[i].client_fd == -1) continue;
+      int name_len = strlen(player_data[i].name);
+      // Leave room for a separator, the name, and a trailing ellipsis
+      if (len + 2 + name_len + 3 >= MAX_RECV_BUF_LEN) {
+        memcpy(recv_buffer + len, "...", 3);
+        len += 3;
+        break;
+      }
+      if (!first) {
+        memcpy(recv_buffer + len, ", ", 2);
+        len += 2;
+      }
+      memcpy(recv_buffer + len, player_data[i].name, name_len);
+      len += name_len;
+      first = false;
+    }
+    sc_systemChat(client_fd, (char *)recv_buffer, (uint16_t)len);
+    goto cleanup;
+  }
+
   if (!strncmp((char *)recv_buffer, "!help", 5)) {
     // Send command guide
     const char help_msg[] = "§7Commands:\n"
     "  !msg <player> <message> - Send a private message\n"
+    "  !list - List online players\n"
     "  !help - Show this help message";
     sc_systemChat(client_fd, (char *)help_msg, (uint16_t)sizeof(help_msg) - 1);
     goto cleanup;
